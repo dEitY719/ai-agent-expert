@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""
+연구 자료 저장 MCP 서버
+FastMCP를 사용하여 연구 자료를 저장하고 관리하는 MCP 서버를 구현합니다.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import shutil
+import uuid
+from datetime import datetime
+from pathlib import Path
+from threading import Lock
+from typing import Any, Dict, List, Optional
+
+from fastmcp import FastMCP
+from pydantic import BaseModel, Field, validator
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('research_mcp.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# 데이터 모델 정의
+class ResearchMaterial(BaseModel):
+    """연구 자료 모델"""
+    id: str = Field(..., description="연구 자료 고유 ID")
+    title: str = Field(..., description="연구 자료 제목", min_length=1)
+    content: str = Field(..., description="연구 자료 내용", min_length=1)
+    category: str = Field(..., description="연구 자료 카테고리", min_length=1)
+    tags: List[str] = Field(default_factory=list, description="연구 자료 태그")
+    source_url: Optional[str] = Field(None, description="원본 출처 URL")
+    created_at: datetime = Field(default_factory=datetime.now, description="생성 일시")
+    updated_at: datetime = Field(default_factory=datetime.now, description="수정 일시")
+    author: Optional[str] = Field(None, description="저자")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="추가 메타데이터")
+
+    @validator('tags')
+    def validate_tags(cls, v):
+        """태그 유효성 검사"""
+        return [tag.strip() for tag in v if tag.strip()]
+
+    @validator('category')
+    def validate_category(cls, v):
+        """카테고리 유효성 검사"""
+        return v.strip()
+
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
+
+# MCP 서버 생성
+research_server = FastMCP(
+    name="Research Storage MCP Server",
+    instructions="연구 자료를 저장하고 관리하는 MCP 서버입니다. 연구 자료의 저장, 검색, 수정, 삭제 기능을 제공합니다."
+)
+
+# 데이터 저장 경로
+DATA_DIR = Path(__file__).parent / "research_data"
+DATA_DIR.mkdir(exist_ok=True)
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_DIR.mkdir(exist_ok=True)
+MATERIALS_FILE = DATA_DIR / "materials.json"
+
+# 파일 접근 동기화를 위한 락
+file_lock = Lock()
+
+def create_backup():
+    """현재 데이터의 백업을 생성합니다."""
+    if MATERIALS_FILE.exists():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = BACKUP_DIR / f"materials_backup_{timestamp}.json"
+        try:
+            shutil.copy2(MATERIALS_FILE, backup_file)
+            logger.info(f"백업 생성됨: {backup_file}")
+            
+            # 오래된 백업 파일 정리 (최근 10개만 유지)
+            backup_files = sorted(BACKUP_DIR.glob("materials_backup_*.json"))
+            if len(backup_files) > 10:
+                for old_backup in backup_files[:-10]:
+                    old_backup.unlink()
+                    logger.info(f"오래된 백업 삭제됨: {old_backup}")
+        except Exception as e:
+            logger.error(f"백업 생성 실패: {e}")
+
+def custom_json_serializer(obj):
+    """사용자 정의 JSON 직렬화 함수"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+def load_materials() -> Dict[str, ResearchMaterial]:
+    """저장된 연구 자료들을 로드합니다."""
+    if not MATERIALS_FILE.exists():
+        logger.info("자료 파일이 존재하지 않습니다. 빈 저장소로 시작합니다.")
+        return {}
+
+    try:
+        with file_lock:
+            with open(MATERIALS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                materials = {}
+                for material_id, material_data in data.items():
+                    try:
+                        # datetime 문자열을 다시 datetime 객체로 변환
+                        if 'created_at' in material_data and isinstance(material_data['created_at'], str):
+                            material_data['created_at'] = datetime.fromisoformat(material_data['created_at'])
+                        if 'updated_at' in material_data and isinstance(material_data['updated_at'], str):
+                            material_data['updated_at'] = datetime.fromisoformat(material_data['updated_at'])
+                        
+                        materials[material_id] = ResearchMaterial(**material_data)
+                    except Exception as e:
+                        logger.error(f"자료 파싱 오류 (ID: {material_id}): {e}")
+                        continue
+                
+                logger.info(f"자료 로드 완료: {len(materials)}개")
+                return materials
+    except Exception as e:
+        logger.error(f"자료 로드 오류: {e}")
+        return {}
+
+def save_materials(materials: Dict[str, ResearchMaterial]):
+    """연구 자료들을 저장합니다."""
+    try:
+        # 백업 생성
+        create_backup()
+        
+        with file_lock:
+            data = {
+                material_id: material.dict()
+                for material_id, material in materials.items()
+            }
+            
+            # 임시 파일에 먼저 저장
+            temp_file = MATERIALS_FILE.with_suffix('.tmp')
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, default=custom_json_serializer)
+            
+            # 원자적 교체
+            temp_file.replace(MATERIALS_FILE)
+            logger.info(f"자료 저장 완료: {len(materials)}개")
+            
+    except Exception as e:
+        logger.error(f"자료 저장 오류: {e}")
+        raise
+
+# 전역 자료 저장소
+try:
+    materials_store = load_materials()
+except Exception as e:
+    logger.error(f"초기 자료 로드 실패: {e}")
+    materials_store = {}
+
+@research_server.resource(
+    "research://materials",
+    description="저장된 모든 연구 자료 목록"
+)
+async def list_all_materials():
+    """저장된 모든 연구 자료의 목록을 반환합니다."""
+    try:
+        materials_list = []
+        for material in materials_store.values():
+            materials_list.append({
+                "id": material.id,
+                "title": material.title,
+                "category": material.category,
+                "tags": material.tags,
+                "created_at": material.created_at.isoformat(),
+                "author": material.author,
+                "content_preview": material.content[:100] + "..." if len(material.content) > 100 else material.content
+            })
+
+        return {
+            "total_count": len(materials_list),
+            "materials": sorted(materials_list, key=lambda x: x["created_at"], reverse=True)
+        }
+    except Exception as e:
+        logger.error(f"자료 목록 조회 오류: {e}")
+        return {"error": "자료 목록을 조회하는 중 오류가 발생했습니다."}
+
+@research_server.resource(
+    "research://materials/{material_id}",
+    description="특정 연구 자료의 상세 정보"
+)
+async def get_material(material_id: str):
+    """특정 연구 자료의 상세 정보를 반환합니다."""
+    try:
+        if material_id not in materials_store:
+            return {"error": f"연구 자료를 찾을 수 없습니다: {material_id}"}
+
+        material = materials_store[material_id]
+        return {
+            "material": material.dict(),
+            "word_count": len(material.content.split()),
+            "character_count": len(material.content),
+            "line_count": len(material.content.split('\n'))
+        }
+    except Exception as e:
+        logger.error(f"자료 조회 오류 (ID: {material_id}): {e}")
+        return {"error": "자료를 조회하는 중 오류가 발생했습니다."}
+
+@research_server.resource(
+    "research://materials/category/{category}",
+    description="특정 카테고리의 연구 자료 목록"
+)
+async def get_materials_by_category(category: str):
+    """특정 카테고리의 연구 자료들을 반환합니다."""
+    try:
+        category_materials = [
+            material for material in materials_store.values()
+            if material.category.lower() == category.lower()
+        ]
+
+        return {
+            "category": category,
+            "count": len(category_materials),
+            "materials": [
+                {
+                    "id": material.id,
+                    "title": material.title,
+                    "tags": material.tags,
+                    "created_at": material.created_at.isoformat(),
+                    "author": material.author,
+                    "content_preview": material.content[:100] + "..." if len(material.content) > 100 else material.content
+                }
+                for material in sorted(category_materials, key=lambda x: x.created_at, reverse=True)
+            ]
+        }
+    except Exception as e:
+        logger.error(f"카테고리별 자료 조회 오류 (카테고리: {category}): {e}")
+        return {"error": "카테고리별 자료를 조회하는 중 오류가 발생했습니다."}
+
+@research_server.resource(
+    "research://materials/tag/{tag}",
+    description="특정 태그가 포함된 연구 자료 목록"
+)
+async def get_materials_by_tag(tag: str):
+    """특정 태그가 포함된 연구 자료들을 반환합니다."""
+    try:
+        tag_materials = [
+            material for material in materials_store.values()
+            if tag.lower() in [t.lower() for t in material.tags]
+        ]
+
+        return {
+            "tag": tag,
+            "count": len(tag_materials),
+            "materials": [
+                {
+                    "id": material.id,
+                    "title": material.title,
+                    "category": material.category,
+                    "created_at": material.created_at.isoformat(),
+                    "author": material.author,
+                    "content_preview": material.content[:100] + "..." if len(material.content) > 100 else material.content
+                }
+                for material in sorted(tag_materials, key=lambda x: x.created_at, reverse=True)
+            ]
+        }
+    except Exception as e:
+        logger.error(f"태그별 자료 조회 오류 (태그: {tag}): {e}")
+        return {"error": "태그별 자료를 조회하는 중 오류가 발생했습니다."}
+
+@research_server.resource(
+    "research://materials/search/{query}",
+    description="키워드 검색 결과"
+)
+async def search_materials(query: str):
+    """제목, 내용, 태그에서 키워드를 검색합니다."""
+    try:
+        if not query.strip():
+            return {"error": "검색어를 입력해주세요."}
+
+        query_lower = query.lower().strip()
+        search_results = []
+
+        for material in materials_store.values():
+            relevance_score = 0
+
+            # 제목 검색 (가중치 높음)
+            if query_lower in material.title.lower():
+                relevance_score += 10
+
+            # 내용 검색
+            if query_lower in material.content.lower():
+                relevance_score += 5
+
+            # 태그 검색 (가중치 높음)
+            if any(query_lower in tag.lower() for tag in material.tags):
+                relevance_score += 8
+
+            # 카테고리 검색
+            if query_lower in material.category.lower():
+                relevance_score += 6
+
+            # 저자 검색
+            if material.author and query_lower in material.author.lower():
+                relevance_score += 7
+
+            if relevance_score > 0:
+                search_results.append({
+                    "material": {
+                        "id": material.id,
+                        "title": material.title,
+                        "category": material.category,
+                        "tags": material.tags,
+                        "created_at": material.created_at.isoformat(),
+                        "author": material.author
+                    },
+                    "relevance_score": relevance_score,
+                    "preview": material.content[:200] + "..." if len(material.content) > 200 else material.content
+                })
+
+        # 관련도 순으로 정렬
+        search_results.sort(key=lambda x: x["relevance_score"], reverse=True)
+
+        return {
+            "query": query,
+            "total_results": len(search_results),
+            "results": search_results
+        }
+    except Exception as e:
+        logger.error(f"검색 오류 (쿼리: {query}): {e}")
+        return {"error": "검색 중 오류가 발생했습니다."}
+
+# 도구(Tools) 정의
+@research_server.tool(
+    name="create_research_material",
+    description="새로운 연구 자료를 생성합니다."
+)
+async def create_research_material(
+    title: str,
+    content: str,
+    category: str,
+    tags: List[str] = None,
+    source_url: str = None,
+    author: str = None
+) -> str:
+    """새로운 연구 자료를 생성합니다."""
+    try:
+        if not title.strip():
+            return "오류: 제목은 필수 입력 항목입니다."
+        
+        if not content.strip():
+            return "오류: 내용은 필수 입력 항목입니다."
+        
+        if not category.strip():
+            return "오류: 카테고리는 필수 입력 항목입니다."
+
+        if tags is None:
+            tags = []
+
+        material_id = str(uuid.uuid4())
+        material = ResearchMaterial(
+            id=material_id,
+            title=title.strip(),
+            content=content.strip(),
+            category=category.strip(),
+            tags=tags,
+            source_url=source_url.strip() if source_url else None,
+            author=author.strip() if author else None
+        )
+
+        materials_store[material_id] = material
+        save_materials(materials_store)
+        logger.info(f"새 자료 생성됨: {material_id} - {title}")
+
+        return f"연구 자료가 성공적으로 생성되었습니다. ID: {material_id}, 제목: {title}"
+    except Exception as e:
+        logger.error(f"자료 생성 오류: {e}")
+        return f"자료 생성 중 오류가 발생했습니다: {str(e)}"
+
+@research_server.tool(
+    name="update_research_material",
+    description="기존 연구 자료를 수정합니다."
+)
+async def update_research_material(
+    material_id: str,
+    title: str = None,
+    content: str = None,
+    category: str = None,
+    tags: List[str] = None,
+    source_url: str = None,
+    author: str = None
+) -> str:
+    """기존 연구 자료를 수정합니다."""
+    try:
+        if material_id not in materials_store:
+            return f"오류: 연구 자료를 찾을 수 없습니다. ID: {material_id}"
+
+        material = materials_store[material_id]
+        original_title = material.title
+
+        # 제공된 값들만 업데이트
+        if title is not None and title.strip():
+            material.title = title.strip()
+        if content is not None and content.strip():
+            material.content = content.strip()
+        if category is not None and category.strip():
+            material.category = category.strip()
+        if tags is not None:
+            material.tags = [tag.strip() for tag in tags if tag.strip()]
+        if source_url is not None:
+            material.source_url = source_url.strip() if source_url.strip() else None
+        if author is not None:
+            material.author = author.strip() if author.strip() else None
+
+        material.updated_at = datetime.now()
+
+        save_materials(materials_store)
+        logger.info(f"자료 수정됨: {material_id} - {original_title}")
+
+        return f"연구 자료가 성공적으로 수정되었습니다. ID: {material_id}, 제목: {material.title}"
+    except Exception as e:
+        logger.error(f"자료 수정 오류 (ID: {material_id}): {e}")
+        return f"자료 수정 중 오류가 발생했습니다: {str(e)}"
+
+@research_server.tool(
+    name="delete_research_material",
+    description="연구 자료를 삭제합니다."
+)
+async def delete_research_material(material_id: str) -> str:
+    """연구 자료를 삭제합니다."""
+    try:
+        if material_id not in materials_store:
+            return f"오류: 연구 자료를 찾을 수 없습니다. ID: {material_id}"
+
+        deleted_material = materials_store.pop(material_id)
+        save_materials(materials_store)
+        logger.info(f"자료 삭제됨: {material_id} - {deleted_material.title}")
+
+        return f"연구 자료가 성공적으로 삭제되었습니다. 제목: {deleted_material.title}"
+    except Exception as e:
+        logger.error(f"자료 삭제 오류 (ID: {material_id}): {e}")
+        return f"자료 삭제 중 오류가 발생했습니다: {str(e)}"
+
+@research_server.tool(
+    name="get_research_statistics",
+    description="연구 자료에 대한 통계를 제공합니다."
+)
+async def get_research_statistics() -> Dict[str, Any]:
+    """연구 자료에 대한 통계를 계산하여 반환합니다."""
+    try:
+        if not materials_store:
+            return {"message": "저장된 연구 자료가 없습니다."}
+
+        total_materials = len(materials_store)
+        categories = {}
+        tags = {}
+        authors = {}
+        total_words = 0
+        total_characters = 0
+
+        for material in materials_store.values():
+            # 카테고리별 통계
+            categories[material.category] = categories.get(material.category, 0) + 1
+
+            # 태그별 통계
+            for tag in material.tags:
+                tags[tag] = tags.get(tag, 0) + 1
+
+            # 저자별 통계
+            if material.author:
+                authors[material.author] = authors.get(material.author, 0) + 1
+
+            # 총 단어 수와 문자 수
+            words = len(material.content.split())
+            total_words += words
+            total_characters += len(material.content)
+
+        return {
+            "total_materials": total_materials,
+            "total_words": total_words,
+            "total_characters": total_characters,
+            "categories": categories,
+            "top_tags": sorted(tags.items(), key=lambda x: x[1], reverse=True)[:10],
+            "authors": authors,
+            "average_words_per_material": total_words / total_materials if total_materials > 0 else 0,
+            "average_characters_per_material": total_characters / total_materials if total_materials > 0 else 0
+        }
+    except Exception as e:
+        logger.error(f"통계 계산 오류: {e}")
+        return {"error": "통계를 계산하는 중 오류가 발생했습니다."}
+
+@research_server.tool(
+    name="export_research_materials",
+    description="연구 자료를 JSON 형식으로 내보냅니다."
+)
+async def export_research_materials(category: str = None, format: str = "json") -> str:
+    """연구 자료를 지정된 형식으로 내보냅니다."""
+    try:
+        if format.lower() != "json":
+            return "오류: 현재 JSON 형식만 지원합니다."
+
+        export_data = {}
+
+        if category:
+            # 특정 카테고리만 내보내기
+            export_data = {
+                material_id: material.dict()
+                for material_id, material in materials_store.items()
+                if material.category.lower() == category.lower()
+            }
+        else:
+            # 모든 자료 내보내기
+            export_data = {
+                material_id: material.dict()
+                for material_id, material in materials_store.items()
+            }
+
+        if not export_data:
+            return f"내보낼 자료가 없습니다. 카테고리: {category or '전체'}"
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"research_export_{timestamp}.json"
+
+        export_path = DATA_DIR / filename
+        with open(export_path, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, ensure_ascii=False, indent=2, default=custom_json_serializer)
+
+        logger.info(f"자료 내보내기 완료: {filename}, {len(export_data)}개")
+        return f"연구 자료가 성공적으로 내보내졌습니다. 파일: {filename}, 자료 수: {len(export_data)}"
+    except Exception as e:
+        logger.error(f"자료 내보내기 오류: {e}")
+        return f"자료 내보내기 중 오류가 발생했습니다: {str(e)}"
+
+@research_server.tool(
+    name="import_research_materials",
+    description="JSON 파일에서 연구 자료를 가져옵니다."
+)
+async def import_research_materials(filename: str, merge_mode: str = "skip") -> str:
+    """JSON 파일에서 연구 자료를 가져옵니다.
+    
+    Args:
+        filename: 가져올 JSON 파일명
+        merge_mode: 'skip' (중복 시 건너뛰기), 'overwrite' (중복 시 덮어쓰기), 'new_id' (새 ID로 생성)
+    """
+    try:
+        import_path = DATA_DIR / filename
+        if not import_path.exists():
+            return f"오류: 파일을 찾을 수 없습니다: {filename}"
+
+        with open(import_path, 'r', encoding='utf-8') as f:
+            import_data = json.load(f)
+
+        imported_count = 0
+        skipped_count = 0
+        error_count = 0
+
+        for material_id, material_data in import_data.items():
+            try:
+                # datetime 문자열을 다시 datetime 객체로 변환
+                if 'created_at' in material_data and isinstance(material_data['created_at'], str):
+                    material_data['created_at'] = datetime.fromisoformat(material_data['created_at'])
+                if 'updated_at' in material_data and isinstance(material_data['updated_at'], str):
+                    material_data['updated_at'] = datetime.fromisoformat(material_data['updated_at'])
+
+                material = ResearchMaterial(**material_data)
+
+                if material_id in materials_store:
+                    if merge_mode == "skip":
+                        skipped_count += 1
+                        continue
+                    elif merge_mode == "overwrite":
+                        materials_store[material_id] = material
+                        imported_count += 1
+                    elif merge_mode == "new_id":
+                        new_id = str(uuid.uuid4())
+                        materials_store[new_id] = material
+                        imported_count += 1
+                else:
+                    materials_store[material_id] = material
+                    imported_count += 1
+
+            except Exception as e:
+                logger.error(f"자료 가져오기 오류 (ID: {material_id}): {e}")
+                error_count += 1
+                continue
+
+        if imported_count > 0:
+            save_materials(materials_store)
+
+        logger.info(f"자료 가져오기 완료: {imported_count}개 가져옴, {skipped_count}개 건너뜀, {error_count}개 오류")
+        return f"자료 가져오기 완료. 가져온 자료: {imported_count}개, 건너뛴 자료: {skipped_count}개, 오류: {error_count}개"
+
+    except Exception as e:
+        logger.error(f"자료 가져오기 오류: {e}")
+        return f"자료 가져오기 중 오류가 발생했습니다: {str(e)}"
+
+if __name__ == "__main__":
+    # 서버 시작 시 데이터 로드 확인
+    print(f"📚 연구 자료 저장 MCP 서버 시작")
+    print(f"📁 데이터 저장 경로: {DATA_DIR}")
+    print(f"📁 백업 저장 경로: {BACKUP_DIR}")
+    print(f"📊 현재 저장된 자료 수: {len(materials_store)}")
+    print(f"📝 로그 파일: research_mcp.log")
+    
+    # 서버 실행
+    research_server.run()

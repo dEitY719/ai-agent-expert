@@ -1,0 +1,142 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+# --- 프로젝트 기본 정보 ---
+[project]
+requires-python = ">=3.10"
+version = "0.1.0"
+name = "ai-agent-enhance"
+description = "S.LSI AI Agent Enhancement education"
+authors = [{ name = "deitey719", email = "deity719@github.com" }]
+dependencies = ["pydantic", "PyYAML"]
+
+
+# --- mypy 타입 스터브 ---
+[project.optional-dependencies]
+dev = [
+  "tox",
+  # 코드 품질 및 포맷팅
+  "black",
+  "isort",
+  "mypy",
+  "pylint",
+  "pylint-exit",
+  # 테스트 관련
+  "pytest",
+  "pytest-mock",
+  # mypy 타입 스터브 (types-*)
+  "types-toml",
+  "types-requests",
+  "types-PyYAML",
+]
+
+
+[tool.setuptools]
+# src 디렉토리를 패키지 루트로 지정하여 src/your_project_name/ 를 패키지로 인식
+# package-dir = {"" = "src"}
+# py_modules 에 루트에 있는 단일 파이썬 파일 (모듈)들을 명시적으로 추가
+py-modules = ["ex_module"] # TODO: 루트의 .py 파일 이름들을 여기에 추가
+
+
+[tool.setuptools.packages.find]
+# src 디렉토리 내에서만 패키지를 찾도록 설정
+where = ["src"]
+exclude = ["asset*", "config*", "tests*"] # 패키지로 인식하고 싶지 않은 디렉토리들을 명시적으로 제외 (*를 붙여 하위 디렉토리 전체를 제외)
+
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+
+[tool.black]
+line-length = 120
+target-version = ['py310', 'py311', "py312", "py313"]
+skip-string-normalization = false
+include = '\.(py|ipynb)$'
+exclude = '''
+/(
+    \.git
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+
+[tool.isort]
+profile = "black"
+skip = ["build", ".vscode", ".tox", ".venv"]
+
+
+
+[tool.pylint]
+max-line-length = 120
+ignore = [".venv", ".tox", ".vscode", ".git", "build"]
+# R, C 비활성화는 신중하게 접근해야 합니다.
+# 초기에는 비활성화하되, 점진적으로 활성화하여 코드 개선을 유도하는 것이 좋습니다.
+# 만약 활성화 시 너무 많은 경고가 발생한다면, 특정 규칙만 disable 하세요.
+disable = ["R", "C", "W1203"]
+# disable = ["W1203"] # f-string 경고만 비활성화
+
+
+[tool.mypy]
+files = ["./"]
+# 엄격한 타입 검사를 위한 추가 옵션들 (권장)
+strict = true # 모든 엄격 모드 활성화 (가장 강력)
+# 만약 strict=true 가 너무 부담스럽다면 개별 옵션 활성화
+# no_implicit_optional = true # None을 허용하려면 명시적으로 Optional[Type] 사용
+# warn_return_any = true # Any를 반환하는 함수에 경고
+# warn_unused_ignores = true # 불필요한 # type: ignore 주석에 경고
+# disallow_untyped_defs = true # 타입 힌트가 없는 함수 정의에 경고
+# disallow_incomplete_defs = true # 일부 타입 힌트가 누락된 함수 정의에 경고
+# check_untyped_defs = true # 타입 힌트가 없는 함수 내부도 검사
+# disallow_untyped_calls = true # 타입 힌트가 없는 함수 호출에 경고
+# mypy 검사에서 제외할 디렉터리 및 파일 패턴 (정규 표현식)
+# (?x) 플래그는 정규 표현식 내에서 공백과 주석을 허용하여 가독성을 높입니다.
+exclude = '(?x)( \.venv/ | \.tox/ | \.vscode/ | \.git/ | build/ | config/tox/ )'
+
+
+
+[tool.ruff]
+line-length = 120
+exclude = [
+    ".git",
+    ".tox",
+    ".venv",
+    "build",
+    "dist"
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # Pycodestyle 에러
+    "F",   # Pyflakes
+    "I",   # isort
+    "W",   # Pycodestyle 경고
+    "N",   # Naming
+    "D",   # Docstrings (선택사항)
+    "UP",  # pyupgrade
+    "PL",  # Pylint
+    "Q",   # Quotes
+    "ANN", # Annotations (선택사항)
+    "TID", # Tidy imports
+    "C4",  # Comprehensions
+    "B",   # Bugbear
+]
+
+
+# 충돌 규칙과 pylint 규칙을 명시적으로 무시
+ignore = [
+    "PLR",  # Pylint Refactoring
+    "PLC",  # Pylint Convention
+    "D203", # no-blank-line-before-class (D211)과 충돌
+    "D212"  # multi-line-summary-second-line (D213)과 충돌
+]
+
+[tool.ruff.format]
+# 포맷터 관련 설정 (라인 길이는 전역 설정을 따름)
+# quote-style = "double"
